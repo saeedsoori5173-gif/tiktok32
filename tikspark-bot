@@ -1,0 +1,1425 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+TikSpark Telegram Bot — Owner-Only Edition (Fixed for Hosting)
+"""
+
+import asyncio
+import concurrent.futures
+import hashlib
+import hmac
+import io
+import json
+import os
+import random
+import signal
+import threading
+import time
+import traceback
+import uuid
+from datetime import datetime, timezone, timedelta
+
+import requests
+
+try:
+    from cryptography.fernet import Fernet
+    HAS_CRYPTO = True
+except ImportError:
+    HAS_CRYPTO = False
+
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, filters
+)
+from telegram.constants import ParseMode
+
+# =====================================================
+# ⚙️ CONFIG
+# =====================================================
+# ضع التوكن الجديد هنا
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "6198804155:AAF5Zj-co6guQ6s2bW5hMTvFga8CFRi0WqA")
+
+# الآيدي الخاص بك
+try:
+    OWNER_ID = int(os.environ.get("OWNER_ID", "5952132218"))
+except ValueError:
+    OWNER_ID = 5952132218
+
+# =====================================================
+# 🔒 OWNER GUARD
+# =====================================================
+def is_owner(update):
+    try:
+        uid = None
+        if update.effective_user:
+            uid = update.effective_user.id
+        if update.callback_query and update.callback_query.from_user:
+            uid = update.callback_query.from_user.id
+        return uid is not None and uid == OWNER_ID and OWNER_ID != 0
+    except Exception:
+        return False
+
+async def reject(update):
+    try:
+        if update.callback_query:
+            await update.callback_query.answer("🚫 مخصص للمالك فقط", show_alert=True)
+        elif update.message:
+            uid = update.effective_user.id if update.effective_user else "?"
+            await update.message.reply_text(
+                f"🚫 هذا البوت خاص.\nآيديك: `{uid}`",
+                parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
+
+# =====================================================
+# CONSTANTS
+# =====================================================
+DEFAULT_DEVINFO = '{"d":"61393235613366373261636533656632","n":"494e46494e495820496e66696e6978204c697465203330","o":"16","t":"d","v":"2.2.9","s":"0,0"}'
+USER_AGENTS = ["okhttp/4.12.0", "okhttp/4.11.0", "okhttp/4.10.0"]
+
+keybytes = [0x35, 0x30, 0x1c, 0x2f, 0x2c, 0x2c, 0x28, 0x31,
+            0x35, 0x30, 0x1c, 0x2f, 0x2c, 0x2c, 0x28, 0x31]
+secretkey = bytes([b ^ 0x43 for b in keybytes])
+
+OPERATION_IDS = {
+    "LoginAccount": "3522613813036d73817b2715e67743f8d23d7a85ad08b7e12aa3b29a24a17c43",
+    "AttestDevice": "bfaf5a72aeb9a337811da6a6d13e0b73680a18ffde0c59a23701e55b98ac2515",
+    "GetOrders": "330a1eb97775a2f520b2e848601c40f8211d171c778c18840b37260ce94fb725",
+    "ActionOrder": "5177239275a5e78347f7d925501b1a774b76a086f67c33b0033c740dd676f62b",
+    "CreateOrder": "ad7a6397c3970b1e7601f69d24989bff330e256ee5e39321a8d1ad3fe3879b48",
+}
+ENDPOINT = "https://api.tikspark.xyz/graphql"
+DEFAULT_CSRF = "1786692648457:b5fb61a1a92b2de8ffa0343c5d45ce9f1e578abb695cca7ab6659cfc29f85fe9"
+BAN_CODES = {403, 407, 429}
+
+INTEGRITY_TOKEN = "CpsCARCnMGtvLkiuhYFGDW3rUoE73im9X9NmXA1cHOZZOzgRp5FtsmIrZBoNek0K7XIoZiR9XKg1bpApXNem9MbcR4UiIxz1n4Wgv_LA4hSSAbHzpaAfXcnLyKgwnOXGRUieQ4OOpMTMDRxD6O7kd3jjAfcbcHFt3bdgyw7CJYpxz4oq3lIti658lCdnt1NvJzUwfYSp6eWKcvKV5lScaq-nkplRn7hz38A8kLhYNx6w-7rne41hWCR6BQISVfBewaqeh7RL-9iEDrzK-ECbdEwBnpO_LfAqCJKn1bf5VkVxuPAz5qPvB8cNE7ZBMAyMnDHdjNDwpnZMA2EXsgRsyT6Fm_l3MNugWDdWbRgww6sAw6KrRzeBDETsXTh1ZBpqAWerZWp6AIjaDa-b0NFbOS69HsGnfpE7hljmu3OTsd4tM6nM50qiSc4QGuD4aM-joJFJYKIsWf_grquB66tYnYa2mCWcPl1hIEApHMXbCLiO7nwX-8LXEwCDvVNT4f8mjgtI1__D_C_f4g"
+REQUEST_HASH = "gPyB7FF-XeZc2kwi2L-KZXs21Z8oPErvHD9gn572PyR"
+
+AUTH_FATAL = ("unauthorized", "token expired", "invalid token",
+              "not authenticated", "jwt", "session expired")
+
+DATA_FILE = "bot_data.enc"
+KEY_FILE = "bot.key"
+
+AUTO_REFRESH_INTERVAL = 1800
+MIN_PROXIES_THRESHOLD = 5
+MAX_PROXIES_TO_TEST = 300
+VALIDATION_THREADS = 30
+VALIDATION_TIMEOUT = 6
+VALIDATION_TEST_URL = "https://api.ipify.org?format=json"
+MAX_POOL_SIZE = 500
+
+FREE_PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+]
+
+# =====================================================
+# STORAGE
+# =====================================================
+def _get_cipher():
+    if not HAS_CRYPTO:
+        return None
+    if os.path.exists(KEY_FILE):
+        with open(KEY_FILE, "rb") as f:
+            key = f.read()
+    else:
+        key = Fernet.generate_key()
+        with open(KEY_FILE, "wb") as f:
+            f.write(key)
+        try:
+            os.chmod(KEY_FILE, 0o600)
+        except Exception:
+            pass
+    return Fernet(key)
+
+cipher = _get_cipher()
+
+def storage_save(data):
+    try:
+        text = json.dumps(data, ensure_ascii=False)
+        if cipher:
+            with open(DATA_FILE, "wb") as f:
+                f.write(cipher.encrypt(text.encode("utf-8")))
+        else:
+            with open(DATA_FILE, "w", encoding="utf-8") as f:
+                f.write(text)
+    except Exception as e:
+        print(f"[storage] save: {e}")
+
+def storage_load():
+    try:
+        if not os.path.exists(DATA_FILE):
+            return {"accounts": {}, "active": None}
+        if cipher:
+            with open(DATA_FILE, "rb") as f:
+                text = cipher.decrypt(f.read()).decode("utf-8")
+        else:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                text = f.read()
+        return json.loads(text)
+    except Exception as e:
+        print(f"[storage] load: {e}")
+        return {"accounts": {}, "active": None}
+
+# =====================================================
+# PROXY POOL
+# =====================================================
+class ProxyEndpoint:
+    def __init__(self, url):
+        self.url = url
+        self.failures = 0
+        self.banned_until = None
+        self.successes = 0
+        self.total_time = 0.0
+
+    def is_available(self):
+        return not (self.banned_until and datetime.now(timezone.utc) < self.banned_until)
+
+    def mark_failed(self):
+        self.failures += 1
+        backoff = min(60 * (2 ** max(self.failures - 1, 0)), 3600)
+        if self.failures >= 5:
+            backoff = 86400
+        self.banned_until = datetime.now(timezone.utc) + timedelta(seconds=backoff)
+
+    def mark_ok(self, elapsed=0.0):
+        self.failures = 0
+        self.banned_until = None
+        self.successes += 1
+        self.total_time += elapsed
+
+    def avg_speed(self):
+        return self.total_time / self.successes if self.successes else float("inf")
+
+class ProxyPool:
+    def __init__(self):
+        self.proxies = []
+        self._lock = threading.Lock()
+
+    def acquire(self, exclude_urls=None):
+        exclude_urls = exclude_urls or set()
+        with self._lock:
+            avail = [p for p in self.proxies
+                     if p.is_available() and p.url not in exclude_urls]
+        return min(avail, key=lambda p: p.avg_speed()) if avail else None
+
+    def release(self, proxy):
+        pass
+
+    def stats(self):
+        with self._lock:
+            total = len(self.proxies)
+            avail = sum(1 for p in self.proxies if p.is_available())
+        return total, avail
+
+    def add(self, url):
+        with self._lock:
+            if len(self.proxies) >= MAX_POOL_SIZE:
+                self.proxies = [p for p in self.proxies if p.failures < 5]
+                if len(self.proxies) >= MAX_POOL_SIZE:
+                    return False
+            if any(p.url == url for p in self.proxies):
+                return False
+            self.proxies.append(ProxyEndpoint(url))
+            return True
+
+proxy_pool = ProxyPool()
+
+def make_session(proxy_url):
+    s = requests.Session()
+    if proxy_url:
+        s.proxies = {"http": proxy_url, "https": proxy_url}
+    s.trust_env = False
+    return s
+
+def _normalize_proxy(line):
+    line = line.strip()
+    if not line:
+        return None
+    if "://" in line:
+        if line.startswith("socks5://"):
+            return "socks5h://" + line[len("socks5://"):]
+        return line
+    return "http://" + line
+
+def _download_raw():
+    raw = set()
+
+    def fetch(url):
+        try:
+            r = requests.get(url, timeout=15)
+            r.raise_for_status()
+            return [l.strip() for l in r.text.splitlines()
+                    if l.strip() and not l.startswith("#")]
+        except Exception as e:
+            print(f"[proxy] {url}: {e}")
+            return []
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(FREE_PROXY_SOURCES)) as ex:
+        for lines in ex.map(fetch, FREE_PROXY_SOURCES):
+            raw.update(lines)
+    return raw
+
+def _validate_proxy(proxy_url):
+    try:
+        s = make_session(proxy_url)
+        t0 = time.time()
+        r = s.get(VALIDATION_TEST_URL, timeout=VALIDATION_TIMEOUT)
+        el = time.time() - t0
+        ok = r.status_code == 200 and r.text.strip().startswith("{")
+        s.close()
+        return ok, el
+    except Exception:
+        return False, 0.0
+
+def fetch_free_proxies():
+    print("[proxy] 🔄 جلب...")
+    try:
+        raw = _download_raw()
+    except Exception:
+        return 0
+    if not raw:
+        return 0
+    normalized = list({n for n in (_normalize_proxy(p) for p in raw) if n})
+    with proxy_pool._lock:
+        existing = {p.url for p in proxy_pool.proxies}
+    fresh = [p for p in normalized if p not in existing]
+    if not fresh:
+        return 0
+    if len(fresh) > MAX_PROXIES_TO_TEST:
+        fresh = random.sample(fresh, MAX_PROXIES_TO_TEST)
+    added = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=VALIDATION_THREADS) as ex:
+        for url, (ok, _) in zip(fresh, ex.map(_validate_proxy, fresh)):
+            if ok and proxy_pool.add(url):
+                added += 1
+    print(f"[proxy] ✅ {added} جديد (المجموع: {len(proxy_pool.proxies)})")
+    return added
+
+def cleanup_dead_proxies():
+    with proxy_pool._lock:
+        before = len(proxy_pool.proxies)
+        proxy_pool.proxies = [p for p in proxy_pool.proxies if p.failures < 8]
+        return before - len(proxy_pool.proxies)
+
+# =====================================================
+# API
+# =====================================================
+def getsignature(ts, nonce, payload):
+    return hmac.new(secretkey, f"{ts}-{nonce}-{payload}".encode(),
+                    hashlib.sha256).hexdigest()
+
+def sendrequest(token, csrf, payload_value, operation_name,
+                needs_auth=True, proxy_url=None):
+    try:
+        payload_str = json.dumps(payload_value, separators=(",", ":"))
+        ts = str(int(time.time() * 1000))
+        nonce = str(uuid.uuid4())[:16]
+        sig = getsignature(ts, nonce, payload_str)
+        headers = {
+            "X-APOLLO-OPERATION-NAME": operation_name,
+            "Accept": "multipart/mixed; deferSpec=20220824, application/json",
+            "x-language": "ar",
+            "x-app-name": "com.dev.vidspark",
+            "x-device-info": DEFAULT_DEVINFO,
+            "x-app-sig": sig,
+            "x-app-ts": ts,
+            "x-app-nonce": nonce,
+            "Content-Type": "application/json",
+            "User-Agent": random.choice(USER_AGENTS),
+            "Accept-Encoding": "gzip",
+        }
+        if operation_name in OPERATION_IDS:
+            headers["X-APOLLO-OPERATION-ID"] = OPERATION_IDS[operation_name]
+        if needs_auth:
+            headers["token"] = token
+            headers["x-csrf-token"] = csrf
+        session = make_session(proxy_url)
+        try:
+            r = session.post(ENDPOINT, headers=headers,
+                             data=payload_str, timeout=(10, 20))
+            r.raise_for_status()
+            return r, r.json()
+        finally:
+            try:
+                session.close()
+            except Exception:
+                pass
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response is not None else None
+        if status in BAN_CODES:
+            return None, {"__banned__": True, "status": status,
+                          "error": f"HTTP {status}"}
+        return None, {"error": str(e), "status": status}
+    except requests.exceptions.RequestException as e:
+        return None, {"__proxy_error__": True, "error": str(e)}
+    except json.JSONDecodeError:
+        return None, {"error": "JSON غير صالح"}
+    except Exception as e:
+        return None, {"error": f"{type(e).__name__}: {e}"}
+
+def send_with_retry(token, csrf, payload_value, operation_name,
+                    needs_auth, account, max_attempts=None):
+    tried = set()
+    attempt = 0
+    last_err = {"error": "no attempt"}
+    while True:
+        try:
+            proxy = account.get("proxy") if account else None
+            proxy_url = proxy.url if proxy else None
+            resp, result = sendrequest(token, csrf, payload_value,
+                                       operation_name, needs_auth, proxy_url)
+            if (result and "error" not in result
+                    and "__banned__" not in result
+                    and "__proxy_error__" not in result):
+                if proxy:
+                    proxy.mark_ok()
+                return resp, result
+            if result and "errors" in result:
+                msg = str(result.get("errors", [{}])[0].get("message", "")).lower()
+                if any(k in msg for k in AUTH_FATAL):
+                    if account is not None:
+                        account["_needs_relogin"] = True
+                    return resp, result
+            if proxy:
+                tried.add(proxy.url)
+                proxy.mark_failed()
+                if account:
+                    account["proxy"] = None
+            alt = proxy_pool.acquire(exclude_urls=tried)
+            if alt and account:
+                account["proxy"] = alt
+            last_err = result or {"error": "unknown"}
+            attempt += 1
+            if max_attempts and attempt >= max_attempts:
+                return None, last_err
+            time.sleep(min(2 ** min(attempt, 4), 30))
+        except Exception as e:
+            print(f"[retry] {e}")
+            last_err = {"error": str(e)}
+            attempt += 1
+            time.sleep(3)
+            if max_attempts and attempt >= max_attempts:
+                return None, last_err
+
+# =====================================================
+# STATE
+# =====================================================
+STATE = {
+    "accounts": {},
+    "active": None,
+    "chat_id": None,
+}
+
+def _acc_default():
+    return {
+        "token": "", "csrf": DEFAULT_CSRF, "score": 0, "password": "",
+        "farming": False, "farm_task": None, "proxy": None,
+        "schedule": {"enabled": False, "start": "02:00", "stop": "06:00"},
+        "balance_alert": None, "stats": {}, "_needs_relogin": False,
+    }
+
+def _load():
+    data = storage_load()
+    STATE["active"] = data.get("active")
+    for uname, acc_data in data.get("accounts", {}).items():
+        acc = _acc_default()
+        acc.update({k: v for k, v in acc_data.items()
+                    if k in ("token", "csrf", "score", "password",
+                             "schedule", "balance_alert", "stats")})
+        STATE["accounts"][uname] = acc
+    print(f"[storage] تم تحميل {len(STATE['accounts'])} حساب")
+
+def _save():
+    out = {"active": STATE["active"], "accounts": {}}
+    for uname, acc in STATE["accounts"].items():
+        out["accounts"][uname] = {
+            "token": acc.get("token", ""),
+            "csrf": acc.get("csrf", DEFAULT_CSRF),
+            "score": acc.get("score", 0),
+            "password": acc.get("password", ""),
+            "schedule": acc.get("schedule", {}),
+            "balance_alert": acc.get("balance_alert"),
+            "stats": acc.get("stats", {}),
+        }
+    storage_save(out)
+
+def _today_key():
+    return datetime.now().strftime("%Y-%m-%d")
+
+def _record(acc, key, value=1):
+    day = _today_key()
+    stats = acc.setdefault("stats", {})
+    stats.setdefault(day, {"tasks": 0, "good": 0, "bad": 0})
+    stats[day][key] = stats[day].get(key, 0) + value
+
+# =====================================================
+# AUTO RELOGIN
+# =====================================================
+async def try_relogin(username):
+    acc = STATE["accounts"].get(username)
+    if not acc or not acc.get("password"):
+        return False
+    print(f"[relogin] 🔐 {username}")
+    proxy = acc.get("proxy") or proxy_pool.acquire()
+    proxy_url = proxy.url if proxy else None
+    payload = {
+        "operationName": "LoginAccount",
+        "variables": {"data": {
+            "id": "", "uniqueId": username, "nickname": "",
+            "avatarMedium": "https://p16-common-sign.tiktokcdn.com/musically-maliva-obj/1594805258216454~tplv-tiktokx-cropcenter:720:720.webp",
+            "followerCount": 0, "followingCount": 0, "videoCount": 0,
+            "privateAccount": False, "diggCount": 0,
+            "authMethod": "local", "password": acc["password"]
+        }},
+        "query": "mutation LoginAccount($data: TiktokInfo) { loginTiktok(data: $data) { accessToken user { score } } }",
+    }
+    resp, result = await asyncio.to_thread(
+        sendrequest, "", "", payload, "LoginAccount", False, proxy_url)
+    if not (resp and result and "errors" not in result and "error" not in result):
+        return False
+    try:
+        acc["token"] = result["data"]["loginTiktok"]["accessToken"]
+        acc["csrf"] = resp.headers.get("x-csrf-token") or DEFAULT_CSRF
+        acc["score"] = result["data"]["loginTiktok"]["user"].get("score", 0)
+        if proxy:
+            acc["proxy"] = proxy
+        acc["_needs_relogin"] = False
+        _save()
+        print(f"[relogin] ✅ {username}")
+        return True
+    except Exception:
+        return False
+
+# =====================================================
+# FARM LOOP
+# =====================================================
+async def farm_loop(username, context):
+    acc = STATE["accounts"].get(username)
+    if not acc:
+        return
+    chat_id = STATE.get("chat_id")
+    total = good = bad = 0
+    status_msg = None
+    last_update = 0
+    fails = 0
+    pause_count = 0
+
+    while acc.get("farming", False):
+        try:
+            if acc.get("_needs_relogin"):
+                if not await try_relogin(username):
+                    await asyncio.sleep(60)
+                    continue
+
+            if pause_count >= 20:
+                await asyncio.sleep(random.randint(30, 60))
+                pause_count = 0
+
+            payload = {"operationName": "GetOrders", "variables": {},
+                       "query": "query GetOrders { getOrders { _id status } }"}
+            _, res = await asyncio.to_thread(
+                send_with_retry, acc["token"], acc["csrf"],
+                payload, "GetOrders", True, acc)
+
+            if not res or "data" not in res:
+                fails += 1
+                await asyncio.sleep(min(5 * fails, 60))
+                continue
+            fails = 0
+            orders = res.get("data", {}).get("getOrders", []) or []
+            pending = [o["_id"] for o in orders if o.get("status") == "pending"]
+            if not pending:
+                await asyncio.sleep(10)
+                continue
+
+            for task_id in pending:
+                if not acc.get("farming", False):
+                    break
+                try:
+                    rn = random.randint(3000, 4500)
+                    ap = {
+                        "operationName": "ActionOrder",
+                        "variables": {
+                            "orderId": task_id,
+                            "validationData": {
+                                "attempts": 1,
+                                "initialNumber": float(rn),
+                                "timeSpent": float(random.randint(4000, 7000)),
+                                "actualCount": rn + 1,
+                                "source": "CLIENT_CRONET"
+                            }
+                        },
+                        "query": "mutation ActionOrder($orderId: ID!, $validationData: ValidationDataInput!) { actionOrder(orderId: $orderId, validationData: $validationData) { score } }",
+                    }
+                    _, ar = await asyncio.to_thread(
+                        send_with_retry, acc["token"], acc["csrf"],
+                        ap, "ActionOrder", True, acc)
+                    total += 1
+                    pause_count += 1
+                    _record(acc, "tasks")
+                    if ar and "data" in ar:
+                        try:
+                            sc = int(ar.get("data", {}).get("actionOrder", {}).get("score", 0))
+                            good += sc
+                            _record(acc, "good", sc)
+                        except Exception:
+                            pass
+                    else:
+                        bad += 1
+                        _record(acc, "bad")
+                except Exception as e:
+                    print(f"[farm] {e}")
+                    bad += 1
+
+                if total - last_update >= 5:
+                    last_update = total
+                    p = acc.get("proxy")
+                    pm = f"🌐 {p.url[:40]}" if p else "⚠️"
+                    txt = (f"💰 *تجميع `{username}`*\n\n"
+                           f"📊 {total}\n✅ {good}\n❌ {bad}\n{pm}")
+                    try:
+                        if status_msg:
+                            await status_msg.edit_text(txt, parse_mode=ParseMode.MARKDOWN)
+                        else:
+                            status_msg = await context.bot.send_message(
+                                chat_id, txt, parse_mode=ParseMode.MARKDOWN)
+                    except Exception:
+                        pass
+                await asyncio.sleep(max(0.5, random.gauss(2.2, 0.6)))
+
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            print(f"[farm] loop: {e}")
+            await asyncio.sleep(5)
+
+    final = f"🛑 *توقف `{username}`*\n\n📊 {total} | ✅ {good} | ❌ {bad}"
+    try:
+        if status_msg:
+            await status_msg.edit_text(final, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await context.bot.send_message(chat_id, final, parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
+    _save()
+
+# =====================================================
+# BACKGROUND TASKS
+# =====================================================
+async def proxy_task(context):
+    while True:
+        try:
+            _, avail = proxy_pool.stats()
+            if avail < MIN_PROXIES_THRESHOLD:
+                cleanup_dead_proxies()
+                await asyncio.to_thread(fetch_free_proxies)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[proxy-task] {e}")
+        try:
+            await asyncio.sleep(AUTO_REFRESH_INTERVAL)
+        except asyncio.CancelledError:
+            return
+
+async def watchdog(context):
+    while True:
+        try:
+            for uname, acc in list(STATE["accounts"].items()):
+                if acc.get("farming"):
+                    t = acc.get("farm_task")
+                    if not t or t.done():
+                        print(f"[watchdog] 🔄 {uname}")
+                        acc["farm_task"] = asyncio.create_task(
+                            farm_loop(uname, context))
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[watch] {e}")
+        try:
+            await asyncio.sleep(300)
+        except asyncio.CancelledError:
+            return
+
+async def scheduler(context):
+    while True:
+        try:
+            now = datetime.now().strftime("%H:%M")
+            for uname, acc in list(STATE["accounts"].items()):
+                sch = acc.get("schedule", {})
+                if not sch.get("enabled"):
+                    continue
+                if sch.get("start") == now and not acc.get("farming"):
+                    acc["farming"] = True
+                    acc["farm_task"] = asyncio.create_task(
+                        farm_loop(uname, context))
+                    try:
+                        await context.bot.send_message(
+                            STATE["chat_id"], f"⏰ بدأ: `{uname}`",
+                            parse_mode=ParseMode.MARKDOWN)
+                    except Exception:
+                        pass
+                if sch.get("stop") == now and acc.get("farming"):
+                    acc["farming"] = False
+                    if acc.get("farm_task"):
+                        acc["farm_task"].cancel()
+                        acc["farm_task"] = None
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[sched] {e}")
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            return
+
+async def alerts(context):
+    while True:
+        try:
+            for uname, acc in list(STATE["accounts"].items()):
+                thr = acc.get("balance_alert")
+                if thr and acc.get("score", 0) >= thr:
+                    try:
+                        await context.bot.send_message(
+                            STATE["chat_id"],
+                            f"🔔 `{uname}`: {acc['score']} ≥ {thr}",
+                            parse_mode=ParseMode.MARKDOWN)
+                    except Exception:
+                        pass
+                    acc["balance_alert"] = None
+                    _save()
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            print(f"[alert] {e}")
+        try:
+            await asyncio.sleep(600)
+        except asyncio.CancelledError:
+            return
+
+# =====================================================
+# KEYBOARDS
+# =====================================================
+def back_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back")]
+    ])
+
+def main_kb():
+    rows = []
+    if STATE["accounts"]:
+        active = STATE["active"]
+        acc = STATE["accounts"].get(active, {})
+        score = acc.get("score", 0)
+        pm = "🌐" if acc.get("proxy") else "⚠️"
+        sm = "⏰" if acc.get("schedule", {}).get("enabled") else ""
+        rows.append([InlineKeyboardButton(
+            f"👤 {active} ⭐{score} {pm}{sm}", callback_data="accounts")])
+        rows.append([
+            InlineKeyboardButton("💰 تجميع", callback_data="farm"),
+            InlineKeyboardButton("🔥 الكل", callback_data="farm_all")])
+        rows.append([
+            InlineKeyboardButton("👥 متابعين", callback_data="followers"),
+            InlineKeyboardButton("❤️ لايكات", callback_data="likes")])
+        rows.append([
+            InlineKeyboardButton("👁 مشاهدات", callback_data="views"),
+            InlineKeyboardButton("💬 تعليقات", callback_data="comments")])
+        rows.append([
+            InlineKeyboardButton("📋 الحسابات", callback_data="accounts"),
+            InlineKeyboardButton("➕ إضافة", callback_data="add_account")])
+        rows.append([
+            InlineKeyboardButton("⏰ جدولة", callback_data="schedule"),
+            InlineKeyboardButton("📊 إحصائيات", callback_data="stats")])
+        rows.append([
+            InlineKeyboardButton("🔔 تنبيه", callback_data="alert"),
+            InlineKeyboardButton("🌐 بروكسيات", callback_data="proxy_stats")])
+    else:
+        rows.append([InlineKeyboardButton("➕ إضافة حساب", callback_data="add_account")])
+        rows.append([InlineKeyboardButton("🌐 بروكسيات", callback_data="proxy_stats")])
+    return InlineKeyboardMarkup(rows)
+
+def accounts_kb():
+    rows = []
+    for u, acc in STATE["accounts"].items():
+        mk = "✅" if u == STATE["active"] else "▫️"
+        fire = "🔥" if acc.get("farming") else ""
+        pm = "🌐" if acc.get("proxy") else "⚠️"
+        rows.append([InlineKeyboardButton(
+            f"{mk} {u} ⭐{acc.get('score', 0)} {fire}{pm}",
+            callback_data=f"switch:{u}")])
+    rows.append([
+        InlineKeyboardButton("➕ إضافة", callback_data="add_account"),
+        InlineKeyboardButton("🗑 حذف", callback_data="accounts_delete")])
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="back")])
+    return InlineKeyboardMarkup(rows)
+
+def delete_kb():
+    rows = [[InlineKeyboardButton(f"❌ {u}", callback_data=f"delete:{u}")]
+            for u in STATE["accounts"]]
+    rows.append([InlineKeyboardButton("🔙 رجوع", callback_data="accounts")])
+    return InlineKeyboardMarkup(rows)
+
+def farm_kb(active):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🛑 إيقاف" if active else "▶️ بدء",
+                              callback_data="farm_stop" if active else "farm_start")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back")]])
+
+def all_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("▶️ بدء الكل", callback_data="farm_start_all")],
+        [InlineKeyboardButton("🛑 إيقاف الكل", callback_data="farm_stop_all")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back")]])
+
+def proxy_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 تجديد", callback_data="proxy_refresh"),
+         InlineKeyboardButton("🧹 تنظيف", callback_data="proxy_cleanup")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back")]])
+
+def schedule_kb(acc):
+    sch = acc.get("schedule", {})
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            "❌ تعطيل" if sch.get("enabled") else "✅ تفعيل",
+            callback_data="sched_toggle")],
+        [InlineKeyboardButton(f"⏰ البدء: {sch.get('start', '02:00')}",
+                              callback_data="sched_start_set")],
+        [InlineKeyboardButton(f"🛑 الإيقاف: {sch.get('stop', '06:00')}",
+                              callback_data="sched_stop_set")],
+        [InlineKeyboardButton("🔙 رجوع", callback_data="back")]])
+
+# =====================================================
+# MAIN MENU
+# =====================================================
+async def show_menu(target, edit=False):
+    total, avail = proxy_pool.stats()
+    if not STATE["accounts"]:
+        text = "🏠 *القائمة*\n\nلا حسابات. أضف حساباً للبدء."
+    else:
+        acc = STATE["accounts"].get(STATE["active"], {})
+        text = (f"🏠 *القائمة الرئيسية*\n\n"
+                f"👤 `{STATE['active']}` | ⭐ *{acc.get('score', 0)}*\n"
+                f"📋 {len(STATE['accounts'])} حساب | 🌐 {avail}/{total}\n\n"
+                f"اختر:")
+    kb = main_kb()
+    try:
+        if edit:
+            await target.edit_message_text(text, reply_markup=kb,
+                                           parse_mode=ParseMode.MARKDOWN)
+        else:
+            await target.reply_text(text, reply_markup=kb,
+                                    parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
+
+# =====================================================
+# COMMANDS
+# =====================================================
+async def start_cmd(update, context):
+    if not is_owner(update):
+        return await reject(update)
+    STATE["chat_id"] = update.effective_chat.id
+    if STATE["accounts"]:
+        await show_menu(update.message)
+    else:
+        context.user_data["awaiting"] = "new_account_username"
+        await update.message.reply_text("➕ أرسل *اسم المستخدم*:",
+                                        parse_mode=ParseMode.MARKDOWN)
+
+async def logout_cmd(update, context):
+    if not is_owner(update):
+        return await reject(update)
+    for acc in STATE["accounts"].values():
+        acc["farming"] = False
+        t = acc.get("farm_task")
+        if t:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+    STATE["accounts"] = {}
+    STATE["active"] = None
+    context.user_data.clear()
+    _save()
+    await update.message.reply_text("✅ حُذف كل شيء.")
+
+async def id_cmd(update, context):
+    uid = update.effective_user.id
+    await update.message.reply_text(f"آيديك: `{uid}`",
+                                    parse_mode=ParseMode.MARKDOWN)
+
+# =====================================================
+# TEXT HANDLER
+# =====================================================
+async def handle_text(update, context):
+    if not is_owner(update):
+        return await reject(update)
+    text = update.message.text.strip()
+    aw = context.user_data.get("awaiting")
+
+    if aw == "new_account_username":
+        context.user_data["tu"] = text
+        context.user_data["awaiting"] = "new_account_password"
+        await update.message.reply_text("🔑 كلمة المرور:",
+                                        parse_mode=ParseMode.MARKDOWN)
+    elif aw == "new_account_password":
+        u = context.user_data.pop("tu", "")
+        context.user_data["awaiting"] = None
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        await do_login(update, u, text)
+    elif aw == "followers_username":
+        context.user_data["fu"] = text
+        context.user_data["awaiting"] = "followers_amount"
+        await update.message.reply_text("🔢 العدد:")
+    elif aw == "followers_amount":
+        u = context.user_data.pop("fu")
+        context.user_data["awaiting"] = None
+        await do_order(update, context, "followers", u, None, text)
+    elif aw in ("likes_link", "views_link", "comments_link"):
+        context.user_data["fl"] = text
+        k = aw.split("_")[0]
+        context.user_data["awaiting"] = f"{k}_amount"
+        await update.message.reply_text("🔢 العدد:")
+    elif aw in ("likes_amount", "views_amount", "comments_amount"):
+        k = aw.split("_")[0]
+        link = context.user_data.pop("fl")
+        context.user_data["awaiting"] = None
+        await do_order(update, context, k, None, link, text)
+    elif aw in ("sched_start", "sched_stop"):
+        try:
+            datetime.strptime(text, "%H:%M")
+            acc = STATE["accounts"].get(STATE["active"])
+            if acc:
+                acc["schedule"]["start" if aw.endswith("start") else "stop"] = text
+                _save()
+            context.user_data["awaiting"] = None
+            await update.message.reply_text(f"✅ {text}")
+        except ValueError:
+            await update.message.reply_text("❌ صيغة `HH:MM`",
+                                            parse_mode=ParseMode.MARKDOWN)
+    elif aw == "alert_threshold":
+        try:
+            v = int(text)
+            if v <= 0:
+                raise ValueError
+            acc = STATE["accounts"].get(STATE["active"])
+            if acc:
+                acc["balance_alert"] = v
+                _save()
+            context.user_data["awaiting"] = None
+            await update.message.reply_text(f"✅ تنبيه عند {v}")
+        except ValueError:
+            await update.message.reply_text("❌ رقم صحيح.")
+    else:
+        await update.message.reply_text("استخدم /start.")
+
+# =====================================================
+# LOGIN
+# =====================================================
+async def do_login(update, username, password):
+    msg = await update.message.reply_text(f"⏳ `{username}`...",
+                                          parse_mode=ParseMode.MARKDOWN)
+    proxy = proxy_pool.acquire()
+    pu = proxy.url if proxy else None
+    payload = {
+        "operationName": "LoginAccount",
+        "variables": {"data": {
+            "id": "", "uniqueId": username, "nickname": "",
+            "avatarMedium": "https://p16-common-sign.tiktokcdn.com/musically-maliva-obj/1594805258216454~tplv-tiktokx-cropcenter:720:720.webp",
+            "followerCount": 0, "followingCount": 0, "videoCount": 0,
+            "privateAccount": False, "diggCount": 0,
+            "authMethod": "local", "password": password
+        }},
+        "query": "mutation LoginAccount($data: TiktokInfo) { loginTiktok(data: $data) { accessToken user { score username } } }",
+    }
+    resp, result = await asyncio.to_thread(
+        sendrequest, "", "", payload, "LoginAccount", False, pu)
+    if not (resp and result and "errors" not in result and "error" not in result):
+        err = "فشل"
+        if result and "errors" in result:
+            err = result["errors"][0].get("message", err)
+        elif result:
+            err = result.get("error", err)
+        if proxy:
+            proxy.mark_failed()
+        await msg.edit_text(f"❌ {err}")
+        return
+    if proxy:
+        proxy.mark_ok()
+    try:
+        token = result["data"]["loginTiktok"]["accessToken"]
+        user = result["data"]["loginTiktok"]["user"]
+        uname = user.get("username", username)
+        score = user.get("score", 0)
+        csrf = resp.headers.get("x-csrf-token") or DEFAULT_CSRF
+    except KeyError as e:
+        await msg.edit_text(f"❌ {e}")
+        return
+
+    await msg.edit_text("⏳ التحقق...")
+    ap = {
+        "operationName": "AttestDevice",
+        "variables": {"integrityToken": INTEGRITY_TOKEN,
+                      "requestHash": REQUEST_HASH},
+        "query": "mutation AttestDevice($integrityToken: String!, $requestHash: String!) { attestDevice(integrityToken: $integrityToken, requestHash: $requestHash) { ok verified } }",
+    }
+    _, ar = await asyncio.to_thread(
+        sendrequest, token, csrf, ap, "AttestDevice", True, pu)
+    if not ar or "errors" in ar:
+        if proxy:
+            proxy.mark_failed()
+        await msg.edit_text("❌ فشل التحقق.")
+        return
+
+    was = uname in STATE["accounts"]
+    old = STATE["accounts"].get(uname)
+    if old and old.get("farm_task"):
+        old["farming"] = False
+        try:
+            old["farm_task"].cancel()
+        except Exception:
+            pass
+    acc = _acc_default()
+    acc.update({"token": token, "csrf": csrf, "score": score,
+                "password": password, "proxy": proxy})
+    STATE["accounts"][uname] = acc
+    if not STATE["active"]:
+        STATE["active"] = uname
+    _save()
+    pm = f"\n🌐 `{proxy.url[:50]}`" if proxy else "\n⚠️ بدون بروكسي"
+    await msg.edit_text(
+        f"✅ *{'تحديث' if was else 'إضافة'}*\n\n"
+        f"👤 `{uname}`\n⭐ {score}{pm}",
+        parse_mode=ParseMode.MARKDOWN)
+    await show_menu(msg)
+
+# =====================================================
+# ORDER
+# =====================================================
+async def do_order(update, context, kind, username, link, amount_str):
+    if not STATE["active"]:
+        await update.message.reply_text("❌ لا حساب.")
+        return
+    acc = STATE["accounts"][STATE["active"]]
+    try:
+        amount = int(amount_str)
+        if amount <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ رقم غير صالح.")
+        return
+    if acc.get("score", 0) < amount:
+        context.user_data["force_pending"] = {
+            "kind": kind, "amount": amount,
+            "username": username, "link": link
+        }
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ متابعة", callback_data="force_yes")],
+            [InlineKeyboardButton("❌ إلغاء", callback_data="back")]])
+        await update.message.reply_text(
+            f"⚠️ رصيد غير كافٍ\nالرصيد: *{acc.get('score', 0)}* | التكلفة: *{amount}*",
+            reply_markup=kb, parse_mode=ParseMode.MARKDOWN)
+        return
+    msg = await update.message.reply_text("⏳...")
+    await _exec(msg, acc, kind, amount, username, link)
+
+async def _exec(msg, acc, kind, amount, username, link):
+    payload = {
+        "operationName": "CreateOrder",
+        "variables": {
+            "type": kind, "amount": amount,
+            "tiktokerUsername": username, "videoLink": link,
+            "avatar": "https://p16-common-sign.tiktokcdn.com/musically-maliva-obj/1594805258216454~tplv-tiktokx-cropcenter:720:720.webp",
+            "initialCount": 0
+        },
+        "query": "mutation CreateOrder($type: Action!, $amount: Int!, $tiktokerUsername: String, $videoLink: String, $avatar: String, $initialCount: Int) { createOrder(orderInput: { type: $type amount: $amount tiktokerUsername: $tiktokerUsername videoLink: $videoLink avatar: $avatar initialCount: $initialCount } ) { _id type } }",
+    }
+    _, result = await asyncio.to_thread(
+        send_with_retry, acc["token"], acc["csrf"],
+        payload, "CreateOrder", True, acc)
+    if (result and "errors" not in result
+            and "error" not in result and "__banned__" not in result):
+        await msg.edit_text(f"✅ *تم*\n\n📦 {kind}\n🔢 {amount}",
+                            parse_mode=ParseMode.MARKDOWN)
+    else:
+        err = "فشل"
+        if result and "errors" in result:
+            err = result["errors"][0].get("message", err)
+        elif result:
+            err = result.get("error", err)
+        await msg.edit_text(f"❌ {err}")
+
+# =====================================================
+# CALLBACKS
+# =====================================================
+async def cb(update, context):
+    q = update.callback_query
+    try:
+        await q.answer()
+    except Exception:
+        pass
+    if not is_owner(update):
+        return await reject(update)
+    data = q.data
+    STATE["chat_id"] = update.effective_chat.id
+
+    try:
+        if data == "back":
+            context.user_data["awaiting"] = None
+            await show_menu(q, edit=True)
+
+        elif data == "add_account":
+            context.user_data["awaiting"] = "new_account_username"
+            await q.edit_message_text("➕ اسم المستخدم:",
+                                      reply_markup=back_kb(),
+                                      parse_mode=ParseMode.MARKDOWN)
+
+        elif data == "proxy_stats":
+            total, avail = proxy_pool.stats()
+            lines = [f"🌐 *البروكسيات*\n📊 {total} | ✅ {avail} | ❌ {total - avail}\n"]
+            for p in proxy_pool.proxies[:10]:
+                st = "✅" if p.is_available() else "❌"
+                sp = f"{p.avg_speed():.1f}s" if p.successes else "?"
+                lines.append(f"{st} `{p.url[:45]}` ({sp})")
+            if len(proxy_pool.proxies) > 10:
+                lines.append(f"... و{len(proxy_pool.proxies) - 10}")
+            await q.edit_message_text("\n".join(lines),
+                                      reply_markup=proxy_kb(),
+                                      parse_mode=ParseMode.MARKDOWN)
+
+        elif data == "proxy_refresh":
+            await q.edit_message_text("⏳...")
+            added = await asyncio.to_thread(fetch_free_proxies)
+            total, avail = proxy_pool.stats()
+            await q.edit_message_text(
+                f"✅ أضيف {added}\n📊 {total} | ✅ {avail}",
+                reply_markup=proxy_kb())
+
+        elif data == "proxy_cleanup":
+            before = len(proxy_pool.proxies)
+            cleanup_dead_proxies()
+            await q.edit_message_text(
+                f"🧹 {before - len(proxy_pool.proxies)} حُذف",
+                reply_markup=proxy_kb())
+
+        elif data == "accounts":
+            if not STATE["accounts"]:
+                await q.edit_message_text("لا حسابات.", reply_markup=back_kb())
+                return
+            await q.edit_message_text("📋 *الحسابات*",
+                                      reply_markup=accounts_kb(),
+                                      parse_mode=ParseMode.MARKDOWN)
+
+        elif data == "accounts_delete":
+            await q.edit_message_text("🗑 اختر:", reply_markup=delete_kb())
+
+        elif data.startswith("switch:"):
+            u = data.split(":", 1)[1]
+            if u in STATE["accounts"]:
+                STATE["active"] = u
+                await show_menu(q, edit=True)
+            else:
+                await q.answer("غير موجود", show_alert=True)
+
+        elif data.startswith("delete:"):
+            u = data.split(":", 1)[1]
+            acc = STATE["accounts"].pop(u, None)
+            if acc:
+                acc["farming"] = False
+                if acc.get("farm_task"):
+                    try:
+                        acc["farm_task"].cancel()
+                    except Exception:
+                        pass
+            if STATE["active"] == u:
+                STATE["active"] = next(iter(STATE["accounts"]), None)
+            _save()
+            if STATE["accounts"]:
+                await q.edit_message_text(
+                    f"✅ حُذف `{u}`",
+                    reply_markup=accounts_kb(),
+                    parse_mode=ParseMode.MARKDOWN)
+            else:
+                await show_menu(q, edit=True)
+
+        elif data == "farm":
+            if not STATE["active"]:
+                await q.answer("أضف حساباً", show_alert=True)
+                return
+            active = STATE["accounts"][STATE["active"]].get("farming", False)
+            await q.edit_message_text(
+                f"💰 *تجميع `{STATE['active']}`*\n"
+                f"{'🟢 يعمل' if active else '🔴 متوقف'}",
+                reply_markup=farm_kb(active),
+                parse_mode=ParseMode.MARKDOWN)
+
+        elif data == "farm_start":
+            acc = STATE["accounts"].get(STATE["active"])
+            if not acc or acc.get("farming"):
+                await q.answer("مشغول", show_alert=True)
+                return
+            acc["farming"] = True
+            acc["farm_task"] = asyncio.create_task(
+                farm_loop(STATE["active"], context))
+            await q.edit_message_text("▶️ بدأ", reply_markup=farm_kb(True))
+
+        elif data == "farm_stop":
+            acc = STATE["accounts"].get(STATE["active"])
+            if acc:
+                acc["farming"] = False
+                if acc.get("farm_task"):
+                    acc["farm_task"].cancel()
+                    acc["farm_task"] = None
+            await q.edit_message_text("🛑 توقف", reply_markup=farm_kb(False))
+
+        elif data == "farm_all":
+            n = len(STATE["accounts"])
+            run = sum(1 for a in STATE["accounts"].values() if a.get("farming"))
+            await q.edit_message_text(
+                f"🔥 *الكل*\n📋 {n} | 🟢 {run} | 🔴 {n - run}",
+                reply_markup=all_kb(),
+                parse_mode=ParseMode.MARKDOWN)
+
+        elif data == "farm_start_all":
+            c = 0
+            for u, a in STATE["accounts"].items():
+                if not a.get("farming"):
+                    a["farming"] = True
+                    a["farm_task"] = asyncio.create_task(farm_loop(u, context))
+                    c += 1
+            await q.edit_message_text(f"🔥 بدأ {c}", reply_markup=all_kb())
+
+        elif data == "farm_stop_all":
+            for a in STATE["accounts"].values():
+                a["farming"] = False
+                if a.get("farm_task"):
+                    try:
+                        a["farm_task"].cancel()
+                    except Exception:
+                        pass
+                    a["farm_task"] = None
+            await q.edit_message_text("🛑 توقف الكل", reply_markup=all_kb())
+
+        elif data == "schedule":
+            acc = STATE["accounts"].get(STATE["active"])
+            if not acc:
+                await q.answer("لا حساب", show_alert=True)
+                return
+            await q.edit_message_text("⏰ *الجدولة*",
+                                      reply_markup=schedule_kb(acc),
+                                      parse_mode=ParseMode.MARKDOWN)
+
+        elif data == "sched_toggle":
+            acc = STATE["accounts"].get(STATE["active"])
+            if acc:
+                acc["schedule"]["enabled"] = not acc["schedule"].get("enabled", False)
+                _save()
+                await q.edit_message_text("⏰ *الجدولة*",
+                                          reply_markup=schedule_kb(acc),
+                                          parse_mode=ParseMode.MARKDOWN)
+
+        elif data == "sched_start_set":
+            context.user_data["awaiting"] = "sched_start"
+            await q.edit_message_text("⏰ وقت البدء (HH:MM):",
+                                      reply_markup=back_kb())
+
+        elif data == "sched_stop_set":
+            context.user_data["awaiting"] = "sched_stop"
+            await q.edit_message_text("🛑 وقت الإيقاف (HH:MM):",
+                                      reply_markup=back_kb())
+
+        elif data == "alert":
+            acc = STATE["accounts"].get(STATE["active"])
+            if not acc:
+                await q.answer("لا حساب", show_alert=True)
+                return
+            cur = acc.get("balance_alert")
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔕 إلغاء", callback_data="alert_clear")],
+                [InlineKeyboardButton("🔙 رجوع", callback_data="back")]])
+            txt = (f"🔔 *التنبيه*\nالحالي: `{cur or 'لا شيء'}`\n\n"
+                   f"أرسل رقماً لتعيينه.")
+            context.user_data["awaiting"] = "alert_threshold"
+            await q.edit_message_text(txt, reply_markup=kb,
+                                      parse_mode=ParseMode.MARKDOWN)
+
+        elif data == "alert_clear":
+            acc = STATE["accounts"].get(STATE["active"])
+            if acc:
+                acc["balance_alert"] = None
+                _save()
+            await q.edit_message_text("✅ أُلغي", reply_markup=back_kb())
+
+        elif data == "stats":
+            acc = STATE["accounts"].get(STATE["active"])
+            if not acc:
+                await q.answer("لا حساب", show_alert=True)
+                return
+            if not HAS_MPL:
+                stats = acc.get("stats", {})
+                lines = ["📊 *إحصائيات*"]
+                for d, s in list(stats.items())[-7:]:
+                    lines.append(
+                        f"{d}: 📋{s.get('tasks', 0)} "
+                        f"✅{s.get('good', 0)} ❌{s.get('bad', 0)}")
+                await q.edit_message_text("\n".join(lines) or "لا بيانات",
+                                          reply_markup=back_kb(),
+                                          parse_mode=ParseMode.MARKDOWN)
+                return
+            stats = acc.get("stats", {})
+            if not stats:
+                await q.edit_message_text("لا بيانات", reply_markup=back_kb())
+                return
+            days = sorted(stats.keys())[-14:]
+            tasks = [stats[d].get("tasks", 0) for d in days]
+            good = [stats[d].get("good", 0) for d in days]
+            fig, ax = plt.subplots(figsize=(8, 4))
+            ax.bar(days, tasks, label="Tasks", color="#3b82f6", alpha=0.7)
+            ax2 = ax.twinx()
+            ax2.plot(days, good, label="Score", color="#22c55e", marker="o")
+            ax.set_title(f"Statistics — {STATE['active']}")
+            ax.tick_params(axis="x", rotation=45)
+            ax.legend(loc="upper left")
+            ax2.legend(loc="upper right")
+            buf = io.BytesIO()
+            plt.tight_layout()
+            plt.savefig(buf, format="png", dpi=100)
+            plt.close()
+            buf.seek(0)
+            try:
+                await q.message.reply_photo(photo=buf)
+            except Exception:
+                pass
+
+        elif data in ("followers", "likes", "views", "comments"):
+            if not STATE["active"]:
+                await q.answer("أضف حساباً", show_alert=True)
+                return
+            if data == "followers":
+                context.user_data["awaiting"] = "followers_username"
+                await q.edit_message_text("👥 يوزر تيك توك:",
+                                          reply_markup=back_kb())
+            else:
+                context.user_data["awaiting"] = f"{data}_link"
+                await q.edit_message_text("🔗 الرابط:",
+                                          reply_markup=back_kb())
+
+        elif data == "force_yes":
+            pending = context.user_data.pop("force_pending", None)
+            if pending:
+                acc = STATE["accounts"].get(STATE["active"])
+                if acc:
+                    await q.edit_message_text("⏳...")
+                    await _exec(q, acc, pending["kind"], pending["amount"],
+                                pending["username"], pending["link"])
+    except Exception as e:
+        print(f"[cb] {e}")
+        traceback.print_exc()
+
+# =====================================================
+# GLOBAL ERROR HANDLER
+# =====================================================
+async def err_handler(update, context):
+    print(f"[error] {type(context.error).__name__}: {context.error}")
+    try:
+        if update and update.effective_chat and is_owner(update):
+            await context.bot.send_message(
+                update.effective_chat.id,
+                f"⚠️ خطأ (مستمر): `{str(context.error)[:200]}`",
+                parse_mode=ParseMode.MARKDOWN)
+    except Exception:
+        pass
+
+# =====================================================
+# APP RUNNER
+# =====================================================
+async def post_init(app):
+    app.create_task(proxy_task(app))
+    app.create_task(watchdog(app))
+    app.create_task(scheduler(app))
+    app.create_task(alerts(app))
+    print(f"✅ بوت المالك {OWNER_ID} شغال")
+
+def run_once():
+    app = (Application.builder().token(BOT_TOKEN)
+           .connect_timeout(15)
+           .read_timeout(30)
+           .write_timeout(30)
+           .pool_timeout(10)
+           .get_updates_connect_timeout(15)
+           .get_updates_read_timeout(30)
+           .build())
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("menu", start_cmd))
+    app.add_handler(CommandHandler("logout", logout_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
+    app.add_handler(CallbackQueryHandler(cb))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_error_handler(err_handler)
+    app.post_init = post_init
+    app.run_polling(
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+        close_loop=False,
+    )
+
+def main():
+    if OWNER_ID == 0:
+        print("❌ OWNER_ID غير محدد!")
+        return
+    if not BOT_TOKEN or BOT_TOKEN == "ضع_التوكن_الجديد_هنا":
+        print("❌ BOT_TOKEN غير محدد! ضع التوكن الجديد.")
+        return
+
+    _load()
+    
+    crashes = 0
+    while True:
+        try:
+            run_once()
+            crashes = 0
+        except KeyboardInterrupt:
+            print("👋 خروج")
+            return
+        except SystemExit:
+            raise
+        except Exception as e:
+            crashes += 1
+            print(f"[supervisor] 💥 #{crashes}: {e}")
+            traceback.print_exc()
+            if ("unauthorized" in str(e).lower()
+                    or "invalid token" in str(e).lower()):
+                print("❌ توكن خاطئ — انتظار 60s")
+                time.sleep(60)
+                continue
+            time.sleep(min(5 * crashes, 60))
+
+if __name__ == "__main__":
+    def _sig(signum, frame):
+        print(f"[signal] {signum}")
+        raise KeyboardInterrupt
+    try:
+        signal.signal(signal.SIGTERM, _sig)
+    except Exception:
+        pass
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("👋")
